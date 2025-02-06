@@ -88,6 +88,13 @@ class HeapList(interfaces.plugins.PluginInterface):
 
         return string
 
+    def is_addr_uncommitted(self, addr: int, uncommitted_regions: [(int, int)]):
+        for uncommitted_region in uncommitted_regions:
+            if (addr >= uncommitted_region[0]) and (addr <= uncommitted_region[0] + uncommitted_region[1]):
+                return uncommitted_region[1]
+
+        return 0
+
     def _generator(self, procs: Generator[interfaces.objects.ObjectInterface, None, None]):
         kernel = self.context.modules[self.config["kernel"]]
 
@@ -117,9 +124,19 @@ class HeapList(interfaces.plugins.PluginInterface):
                     for segment in heap.SegmentList.to_list(f"{kernel.symbol_table_name}{constants.BANG}_HEAP_SEGMENT", "SegmentListEntry"):
                         heap_entry_addr = segment.BaseAddress
 
-                        # TODO: Check for uncommitted regions instead of relying on PagedInvalidAddressException
+                        uncommitted_regions = []
+                        if segment.NumberOfUnCommittedPages:
+                            for uncommitted_region in segment.UCRSegmentList.to_list(f"{kernel.symbol_table_name}{constants.BANG}_HEAP_UCR_DESCRIPTOR", "SegmentEntry"):
+                                uncommitted_regions.append((uncommitted_region.Address, uncommitted_region.Size))
+
                         try:
                             while heap_entry_addr < segment.LastValidEntry:
+                                if uncommitted_regions:
+                                    no_uncommitted_bytes = self.is_addr_uncommitted(heap_entry_addr, uncommitted_regions)
+                                    if no_uncommitted_bytes:
+                                        heap_entry_addr += no_uncommitted_bytes
+                                        continue
+
                                 heap_entry = self.context.object(_HEAP_ENTRY, heap.vol.layer_name, heap_entry_addr)
 
                                 heap_entry_size = heap_entry.Size
@@ -160,7 +177,8 @@ class HeapList(interfaces.plugins.PluginInterface):
 
                                 heap_entry_addr += heap_entry_size
                         except exceptions.PagedInvalidAddressException as e:
-                            vollog.debug(f"{proc_name} ({pid})\t: Unable to read _HEAP_ENTRY @ {heap_entry_addr:#x}\t: {str(e)}")
+                            no_uncommitted_bytes = sum([region[1] for region in uncommitted_regions])
+                            vollog.warning(f"{proc_name} ({pid})\t: _HEAP {heap.BaseAddress:#x}\t: Unable to read the _HEAP_SEGMENT {segment.BaseAddress:#x} beyond _HEAP_ENTRY {heap_entry_addr:#x} ({segment.LastValidEntry-heap_entry_addr-no_uncommitted_bytes:#x} committed bytes missing)")
             except exceptions.SwappedInvalidAddressException as e:
                 vollog.warning(f"{proc_name} ({pid})\t: Unable to read memory due to memory paging @ {e.invalid_address:#x}")
 
