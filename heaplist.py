@@ -72,6 +72,8 @@ class HeapList(interfaces.plugins.PluginInterface):
 
     def read_heap_entry_data(self, heap_entry: int, heap_entry_size: int, granularity: int) -> bytes:
         trans_layer = self.context.layers[heap_entry.vol.layer_name]
+
+        # The actual data is appended next to the _HEAP_ENTRY (granularity = _HEAP_ENTRY.size)
         return trans_layer.read(heap_entry.vol.offset + granularity, heap_entry_size - granularity)
 
     def flag_to_string(self, flag: int) -> str:
@@ -88,7 +90,7 @@ class HeapList(interfaces.plugins.PluginInterface):
 
         return string
 
-    def is_addr_uncommitted(self, addr: int, uncommitted_regions: [(int, int)]):
+    def is_addr_uncommitted(self, addr: int, uncommitted_regions: [(int, int)]) -> int:
         for uncommitted_region in uncommitted_regions:
             if (addr >= uncommitted_region[0]) and (addr <= uncommitted_region[0] + uncommitted_region[1]):
                 return uncommitted_region[1]
@@ -107,47 +109,46 @@ class HeapList(interfaces.plugins.PluginInterface):
             proc_name = proc.ImageFileName.cast("string", max_length=proc.ImageFileName.vol.count, errors="replace")
 
             try:
-                try:
-                    peb = proc.get_peb()
-                except exceptions.InvalidAddressException:
-                    vollog.warning(f"{proc_name} ({pid})\t: Unable to read the _PEB")
-                    continue
-
+                peb = proc.get_peb()
                 heap_pointers = utility.array_of_pointers(
-                        peb.ProcessHeaps.dereference(),
-                        count=peb.NumberOfHeaps,
-                        subtype=_HEAP,
-                        context=self.context,
-                    )
+                                    peb.ProcessHeaps.dereference(),
+                                    count=peb.NumberOfHeaps,
+                                    subtype=_HEAP,
+                                    context=self.context,
+                                )
+            except exceptions.InvalidAddressException:
+                vollog.warning(f"{proc_name} ({pid})\t: Unable to read the _PEB")
+                continue
 
-                for heap in heap_pointers:
-                    for segment in heap.SegmentList.to_list(f"{kernel.symbol_table_name}{constants.BANG}_HEAP_SEGMENT", "SegmentListEntry"):
-                        heap_entry_addr = segment.BaseAddress
+            for heap in heap_pointers:
+                for segment in heap.SegmentList.to_list(f"{kernel.symbol_table_name}{constants.BANG}_HEAP_SEGMENT", "SegmentListEntry"):
+                    try:
+                        heap_entry_addr = segment.FirstEntry
 
                         uncommitted_regions = []
                         if segment.NumberOfUnCommittedPages:
                             for uncommitted_region in segment.UCRSegmentList.to_list(f"{kernel.symbol_table_name}{constants.BANG}_HEAP_UCR_DESCRIPTOR", "SegmentEntry"):
                                 uncommitted_regions.append((uncommitted_region.Address, uncommitted_region.Size))
 
-                        try:
-                            while heap_entry_addr < segment.LastValidEntry:
-                                if uncommitted_regions:
-                                    no_uncommitted_bytes = self.is_addr_uncommitted(heap_entry_addr, uncommitted_regions)
-                                    if no_uncommitted_bytes:
-                                        heap_entry_addr += no_uncommitted_bytes
-                                        continue
+                        while heap_entry_addr < segment.LastValidEntry:
+                            if uncommitted_regions:
+                                no_uncommitted_bytes = self.is_addr_uncommitted(heap_entry_addr, uncommitted_regions)
+                                if no_uncommitted_bytes:
+                                    heap_entry_addr += no_uncommitted_bytes
+                                    continue
 
-                                heap_entry = self.context.object(_HEAP_ENTRY, heap.vol.layer_name, heap_entry_addr)
+                            heap_entry = self.context.object(_HEAP_ENTRY, segment.vol.layer_name, heap_entry_addr)
 
-                                heap_entry_size = heap_entry.Size
-                                heap_entry_flags = heap_entry.Flags
+                            heap_entry_size = heap_entry.Size
+                            heap_entry_flags = heap_entry.Flags
 
-                                if heap.EncodeFlagMask == 0x100000:
-                                    heap_entry_size ^= heap.Encoding.Size
-                                    heap_entry_flags ^=  heap.Encoding.Flags
+                            if heap.EncodeFlagMask == 0x100000:
+                                heap_entry_size ^= heap.Encoding.Size
+                                heap_entry_flags ^=  heap.Encoding.Flags
 
-                                heap_entry_size *= granularity
+                            heap_entry_size *= granularity
 
+                            try:
                                 data = self.read_heap_entry_data(heap_entry, heap_entry_size, granularity)
 
                                 file_output = "Disabled"
@@ -158,29 +159,31 @@ class HeapList(interfaces.plugins.PluginInterface):
                                         f.write(data)
 
                                 decoded_data = ''.join([c if (c in string.printable) and (c not in string.whitespace) else "." for c in data[:40].decode('ascii', errors="replace").replace("\ufffd", ".")])
+                            except exceptions.InvalidAddressException:
+                                # We retrieved the _HEAP_ENTRY but not the data, we can still traverse the following _HEAP_ENTRYs
+                                vollog.debug(f"{proc_name} ({pid})\t: Unable to read _HEAP_ENTRY data @ {heap_entry_addr:#x}")
+                                file_output = "Unbailable"
+                                decoded_data = "????"
 
-                                yield (
-                                    0,
-                                    (
-                                        pid,
-                                        proc_name,
-                                        format_hints.Hex(heap.BaseAddress),
-                                        format_hints.Hex(segment.BaseAddress),
-                                        format_hints.Hex(heap_entry_addr),
-                                        format_hints.Hex(heap_entry_size),
-                                        f"[{heap_entry_flags:02x}]",
-                                        self.flag_to_string(heap_entry_flags),
-                                        decoded_data,
-                                        file_output
-                                    )
+                            yield (
+                                0,
+                                (
+                                    pid,
+                                    proc_name,
+                                    format_hints.Hex(heap.BaseAddress),
+                                    format_hints.Hex(segment.BaseAddress),
+                                    format_hints.Hex(heap_entry_addr),
+                                    format_hints.Hex(heap_entry_size),
+                                    f"[{heap_entry_flags:02x}]",
+                                    self.flag_to_string(heap_entry_flags),
+                                    decoded_data,
+                                    file_output
                                 )
+                            )
 
-                                heap_entry_addr += heap_entry_size
-                        except exceptions.PagedInvalidAddressException as e:
-                            no_uncommitted_bytes = sum([region[1] for region in uncommitted_regions])
-                            vollog.warning(f"{proc_name} ({pid})\t: _HEAP {heap.BaseAddress:#x}\t: Unable to read the _HEAP_SEGMENT {segment.BaseAddress:#x} beyond _HEAP_ENTRY {heap_entry_addr:#x} ({segment.LastValidEntry-heap_entry_addr-no_uncommitted_bytes:#x} committed bytes missing)")
-            except exceptions.SwappedInvalidAddressException as e:
-                vollog.warning(f"{proc_name} ({pid})\t: Unable to read memory due to memory paging @ {e.invalid_address:#x}")
+                            heap_entry_addr += heap_entry_size
+                    except exceptions.InvalidAddressException:
+                        vollog.warning(f"{proc_name} ({pid})\t: _HEAP_ENTRY missing\t: _HEAP {heap.BaseAddress:#x}\t: Unable to read the _HEAP_SEGMENT {segment.BaseAddress:#x} beyond _HEAP_ENTRY {heap_entry_addr:#x}")
 
     def run(self):
         kernel = self.context.modules[self.config["kernel"]]
