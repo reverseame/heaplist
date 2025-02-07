@@ -1,6 +1,6 @@
 # Heap Extraction Plugin for Volatility 3
 
-This plugin for [Volatility 3](https://github.com/volatilityfoundation/volatility3/) allows forensic analysts to extract heap entries from processes of a Windows memory image. The plugin is particularly useful for identifying and extracting information that may be critical to a forensic investigation, such as injected code, sensitive data, and other relevant process behavior.
+This plugin for [Volatility 3](https://github.com/volatilityfoundation/volatility3/) allows forensic analysts to extract heap entries from processes of a Windows memory image (>= Windows 7). The plugin is particularly useful for identifying and extracting information that may be critical to a forensic investigation, such as injected code, sensitive data, and other relevant process behavior.
 
 **NOTE**: This plugin only supports the traditional NT Heap, the modern [Segment Heap](https://learn.microsoft.com/en-us/windows/win32/sbscs/application-manifests#heaptype) implementation introduced in Windows 10 is not currently supported.
 

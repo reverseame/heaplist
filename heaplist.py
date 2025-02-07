@@ -8,6 +8,7 @@ from volatility3.framework.configuration import requirements
 from volatility3.plugins.windows import pslist
 from volatility3.framework.objects import utility
 from volatility3.framework.renderers import format_hints
+from volatility3.framework.symbols.windows import versions
 
 vollog = logging.getLogger(__name__)
 
@@ -121,7 +122,14 @@ class HeapList(interfaces.plugins.PluginInterface):
                 continue
 
             for heap in heap_pointers:
-                for segment in heap.SegmentList.to_list(f"{kernel.symbol_table_name}{constants.BANG}_HEAP_SEGMENT", "SegmentListEntry"):
+                if heap.has_member("SegmentList"):
+                    # Windows 7 and beyond
+                    segments = heap.SegmentList.to_list(f"{kernel.symbol_table_name}{constants.BANG}_HEAP_SEGMENT", "SegmentListEntry")
+                else:
+                    vollog.warning(f"{proc_name} ({pid})\t: Unsupported _HEAP @ {heap.vol.offset:#x}")
+                    continue
+
+                for segment in segments:
                     try:
                         heap_entry_addr = segment.FirstEntry
 
@@ -154,15 +162,15 @@ class HeapList(interfaces.plugins.PluginInterface):
                                 file_output = "Disabled"
 
                                 if self.config["dump-all"] or (self.config["dump"] == heap_entry_addr):
-                                    file_output = f'{pid}.heap.{heap_entry_addr:x}.dmp'
-                                    with open(file_output, 'wb') as f:
+                                    file_output = f"{pid}.heap.{heap_entry_addr:x}.dmp"
+                                    with open(file_output, "wb") as f:
                                         f.write(data)
 
-                                decoded_data = ''.join([c if (c in string.printable) and (c not in string.whitespace) else "." for c in data[:40].decode('ascii', errors="replace").replace("\ufffd", ".")])
+                                decoded_data = "".join([c if (c in string.printable) and (c not in string.whitespace) else "." for c in data[:40].decode("ascii", errors="replace").replace("\ufffd", ".")])
                             except exceptions.InvalidAddressException:
                                 # We retrieved the _HEAP_ENTRY but not the data, we can still traverse the following _HEAP_ENTRYs
                                 vollog.debug(f"{proc_name} ({pid})\t: Unable to read _HEAP_ENTRY data @ {heap_entry_addr:#x}")
-                                file_output = "Unbailable"
+                                file_output = "Unavailable"
                                 decoded_data = "????"
 
                             yield (
