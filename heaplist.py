@@ -123,7 +123,7 @@ class HeapList(interfaces.plugins.PluginInterface):
 
             for heap in heap_pointers:
                 if heap.has_member("SegmentList"):
-                    # Windows 7 and beyond
+                    # Windows Vista and beyond
                     segments = heap.SegmentList.to_list(f"{kernel.symbol_table_name}{constants.BANG}_HEAP_SEGMENT", "SegmentListEntry")
                 else:
                     vollog.warning(f"{proc_name} ({pid})\t: Unsupported _HEAP @ {heap.vol.offset:#x}")
