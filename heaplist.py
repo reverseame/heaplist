@@ -2,7 +2,7 @@ import enum
 import logging
 import string
 import struct
-from typing import Generator, List, Tuple
+from typing import Generator, List, Tuple, Union, Dict
 
 from volatility3.framework import exceptions, interfaces, renderers, constants, contexts, symbols, objects
 from volatility3.framework.configuration import requirements
@@ -87,6 +87,18 @@ class HeapList(interfaces.plugins.PluginInterface):
             ),
         ]
 
+    def _is_win_8_1_to_11(self, kuser: objects.StructType) -> bool:
+        return ((int(kuser.NtMajorVersion) == 10) and (int(kuser.NtMinorVersion) == 0)) or ((int(kuser.NtMajorVersion) == 6) and (int(kuser.NtMinorVersion) == 3))
+
+    def _is_win_8(self, kuser: objects.StructType) -> bool:
+        return (int(kuser.NtMajorVersion) == 6) and (int(kuser.NtMinorVersion) == 2)
+
+    def _is_win_vista_to_8(self, kuser: objects.StructType) -> bool:
+        return (int(kuser.NtMajorVersion) == 6) and (int(kuser.NtMinorVersion) in (0, 1))
+
+    def _is_win_below_vista(self, kuser: objects.StructType) -> bool:
+        return int(kuser.NtMajorVersion) < 6
+
     def _flag_to_string(self, flag: int) -> str:
         flag_encoded = HEAP_ENTRY_FLAGS(flag)
 
@@ -144,7 +156,9 @@ class HeapList(interfaces.plugins.PluginInterface):
                 if vad_protection == "PAGE_EXECUTE_WRITECOPY":
                     return (vad.get_start(), vad.get_size())
                 else:
-                    vollog.warning(f"Suspicious ntdll.dll at {vad.get_start():#x} (VAD protection {vad_protection})")
+                    pid = proc.UniqueProcessId
+                    proc_name = utility.array_to_string(proc.ImageFileName)
+                    vollog.warning(f"{proc_name} ({pid})\t: Skipping unusual ntdll.dll at {vad.get_start():#x} (VAD protection {vad_protection})")
 
         return (None, None)
 
@@ -188,8 +202,20 @@ class HeapList(interfaces.plugins.PluginInterface):
 
     def _generate_output(self, proc_name: str, pid: objects.Pointer, layer_name: str, heap_entry: objects.StructType, heap_entry_size: int, granularity: int) -> Tuple[str, str]:
         try:
-            """ Read the actual user data appended to the end of the _HEAP_ENTRY """
-            data = self.context.layers[layer_name].read(heap_entry.vol.offset + granularity, heap_entry_size - granularity)
+            """
+            If the entry size is less than the granularity, the size is the actual size of the data
+            appended to the _HEAP_ENTRY. This can only happen on the LFH layer, on the backend layer
+            the minimum size is 2 * granularity due to memory alignment
+            """
+            if (heap_entry_size - granularity) < granularity:
+                user_data_size = heap_entry_size
+                user_data_offset = heap_entry.vol.offset
+            else:
+                user_data_size = heap_entry_size - granularity
+                user_data_offset = heap_entry.vol.offset + granularity
+
+            """ Read the actual user data """
+            data = self.context.layers[layer_name].read(user_data_offset, user_data_size)
 
             file_output = "Disabled"
 
@@ -198,7 +224,10 @@ class HeapList(interfaces.plugins.PluginInterface):
                 with open(file_output, "wb") as f:
                     f.write(data)
 
-            decoded_data = "".join([c if (c in string.printable) and (c not in string.whitespace) else "." for c in data[:40].decode("ascii", errors="replace").replace("\ufffd", ".")])
+            """ Display maximum 0x30 bytes for demonstration purposes, if less, display actual data based on the heap entry size """
+            decoded_size = user_data_size if user_data_size < 0x30 else 0x30
+
+            decoded_data = "".join([c if (c in string.printable) and (c not in string.whitespace) else "." for c in data[:decoded_size].decode("ascii", errors="replace").replace("\ufffd", ".")])
         except exceptions.InvalidAddressException:
             """ We retrieved the _HEAP_ENTRY but not the data, we can still traverse the following _HEAP_ENTRYs """
             vollog.debug(f"{proc_name} ({pid})\t: Unable to read _HEAP_ENTRY data @ {heap_entry.vol.offset:#x}")
@@ -207,16 +236,92 @@ class HeapList(interfaces.plugins.PluginInterface):
 
         return (decoded_data, file_output)
 
+    def _get_lfh_entries(self, proc_name: str, pid: objects.Pointer, ntdll: contexts.Module, layer_name: str, lfh_heap_address: objects.Pointer) -> Dict[int, Dict[str, Union[int, List[Union[objects.StructType, int]]]]]:
+        lfh_entries = {}
+
+        kernel = self.context.modules[self.config["kernel"]]
+        kuser = info.Info.get_kuser_structure(self.context, kernel.layer_name, kernel.symbol_table_name)
+
+        _LIST_ENTRY = kernel.get_type("_LIST_ENTRY")
+        _HEAP_ENTRY = kernel.get_type("_HEAP_ENTRY")
+        granularity = _HEAP_ENTRY.size
+        """ The key will be used later to decode the _HEAP_USERDATA_HEADER information """
+        if self._is_win_8_1_to_11(kuser):
+            LFH_KEY = self._get_lfh_key(ntdll, layer_name)
+
+        _LFH_HEAP = ntdll.get_type("_LFH_HEAP")
+        _LFH_BLOCK_ZONE = ntdll.get_type("_LFH_BLOCK_ZONE")
+        _HEAP_SUBSEGMENT = ntdll.get_type("_HEAP_SUBSEGMENT")
+
+        lfh_heap = self.context.object(_LFH_HEAP, layer_name, lfh_heap_address)
+        block_zones = self.context.object(_LIST_ENTRY, layer_name, lfh_heap.SubSegmentZones.vol.offset).to_list(f"{ntdll.symbol_table_name}{constants.BANG}_LFH_BLOCK_ZONE", "ListEntry")
+
+        for block_zone in block_zones:
+            vollog.debug(f'{proc_name} ({pid})\t: _LFH_BLOCK_ZONE\t\t\t: {block_zone.vol.offset:#x}')
+
+            subsegment_size = _HEAP_SUBSEGMENT.size
+            subsegment_addr = block_zone.vol.offset + (granularity * 2)
+
+            if self._is_win_8_1_to_11(kuser):
+                end_block_zone = subsegment_addr + (subsegment_size * block_zone.NextIndex)
+            else:
+                end_block_zone = block_zone.FreePointer
+
+            while subsegment_addr < end_block_zone:
+                subsegment = self.context.object(_HEAP_SUBSEGMENT, layer_name, subsegment_addr)
+                vollog.debug(f'{proc_name} ({pid})\t: _HEAP_SUBSEGMENT\t\t: {subsegment_addr:#x}')
+                user_blocks = subsegment.UserBlocks
+                vollog.debug(f'{proc_name} ({pid})\t: _HEAP_USERDATA_HEADER\t\t: {user_blocks:#x}')
+
+                try:
+                    if self._is_win_8_1_to_11(kuser):
+                        """ Decode the fields of _HEAP_USERDATA_HEADER.EncodedOffsets """
+                        encoded_offsets = user_blocks.EncodedOffsets.StrideAndOffset ^ user_blocks ^ lfh_heap.vol.offset ^ LFH_KEY
+                        """ Get the relative address of the first _HEAP_ENTRY """
+                        first_allocation_offset = encoded_offsets & 0xFFFF
+                        """ In an LFH segment, all _HEAP_ENTRYs have the same size """
+                        block_stride = ((encoded_offsets ^ user_blocks.EncodedOffsets.BlockStride) >> 16) & 0xFFFF
+                        heap_entry_addr = user_blocks + first_allocation_offset
+                    elif self._is_win_8(kuser):
+                        block_stride = subsegment.BlockSize * granularity
+                        heap_entry_addr = user_blocks + user_blocks.FirstAllocationOffset
+                    else:                            
+                        block_stride = subsegment.BlockSize * granularity
+                        heap_entry_addr = user_blocks + _LFH_BLOCK_ZONE.size
+
+                    """ Simply save the _HEAP_ENTRYs to view them later along with the backend heap entries """
+                    heap_entries = []
+
+                    for _ in range(subsegment.BlockCount):
+                        try:
+                            heap_entry = self.context.object(_HEAP_ENTRY, layer_name, heap_entry_addr)
+                            heap_entries.append(heap_entry)
+                        except exceptions.InvalidAddressException:
+                            """ We know the _HEAP_ENTRY size anyway, continue traversing """
+                            vollog.debug(f"{proc_name} ({pid})\t: Unable to read LFH _HEAP_ENTRY data @ {heap_entry_addr:#x}")
+                            """ We are inserting an int instead of a StructType """
+                            heap_entries.append(heap_entry_addr)
+
+                        heap_entry_addr += block_stride
+
+                    lfh_entries[int(user_blocks)] = {"block_stride": block_stride, "heap_entries": heap_entries}
+                except (exceptions.InvalidAddressException, AssertionError):
+                    vollog.warning(f'{proc_name} ({pid})\t: Unable to parse LFH _HEAP_SUBSEGMENT @ {subsegment_addr:#x}')
+
+                subsegment_addr += subsegment_size
+
+        return lfh_entries
+
     def _generator(self, procs: Generator[interfaces.objects.ObjectInterface, None, None]):
         kernel = self.context.modules[self.config["kernel"]]
         kuser = info.Info.get_kuser_structure(self.context, kernel.layer_name, kernel.symbol_table_name)
 
-        """ Minimum supported is Windows 8.1 (NT 6.3) """
-        if int(kuser.NtMajorVersion) < 6 or (int(kuser.NtMajorVersion) == 6 and int(kuser.NtMinorVersion) < 3):
-            vollog.error(f"Windows {kuser.NtMajorVersion:d}.{kuser.NtMinorVersion:d}\t: Windows image not supported, minimum supported is Windows 8.1 (NT 6.3)")
+        """ Minimum supported is Windows Vista """
+        if self._is_win_below_vista(kuser):
+            vollog.error(f"Windows NT {kuser.NtMajorVersion:d}.{kuser.NtMinorVersion:d} found\t: Windows image not supported, minimum supported is Windows Vista (NT 6.0)")
             return None
 
-        """ Heap back end structures """
+        """ Heap backend structures """
         _HEAP = kernel.get_type("_HEAP")
         _HEAP_ENTRY = kernel.get_type("_HEAP_ENTRY")
         granularity = _HEAP_ENTRY.size
@@ -229,10 +334,6 @@ class HeapList(interfaces.plugins.PluginInterface):
 
         if ntdll is None:
             vollog.warning(f"Failed to load symbols for ntdll.dll, LFH layer parsing is disabled")
-        else:
-            _LFH_HEAP = ntdll.get_type("_LFH_HEAP")
-            _HEAP_LOCAL_SEGMENT_INFO = ntdll.get_type("_HEAP_LOCAL_SEGMENT_INFO")
-            _HEAP_USERDATA_HEADER = ntdll.get_type("_HEAP_USERDATA_HEADER")
 
         for proc in procs:
             pid = proc.UniqueProcessId
@@ -250,68 +351,19 @@ class HeapList(interfaces.plugins.PluginInterface):
                 vollog.warning(f"{proc_name} ({pid})\t: Unable to read the _PEB")
                 continue
 
-            """ The key will be used later to decode the _HEAP_USERDATA_HEADER information """
-            if ntdll is not None:
-                LFH_KEY = self._get_lfh_key(ntdll, peb.vol.layer_name)
-
             for heap in heap_pointers:
                 try:
-                    vollog.debug(f'_HEAP\t\t\t: {heap.BaseAddress:#x}')
+                    vollog.debug(f"_HEAP\t\t\t: {heap:#x}")
                     lfh_entries = {}
 
                     """ We loaded the ntdll.dll symbols to work with the LFH """
                     if ntdll is not None:
                         """ LFH front end layer is active for this _HEAP """
                         if heap.FrontEndHeapType == LFH_HEAP_ACTIVE:
-                            lfh_heap = self.context.object(_LFH_HEAP, peb.vol.layer_name, heap.FrontEndHeap)
-                            vollog.debug(f'_LFH_HEAP\t\t: {lfh_heap.vol.offset:#x}')
-                            segment_info_pointers = utility.array_of_pointers(lfh_heap.SegmentInfoArrays, count=NO_LFH_BUCKETS, subtype=_HEAP_LOCAL_SEGMENT_INFO, context=self.context)
-
-                            for segment_info in segment_info_pointers:
-                                """
-                                Avoid segments with no LFH triggered, LFH is triggered when more than 16 allocations occur
-                                for given size requested by the user
-                                """
-                                if segment_info != 0:
-                                    block_size = 0
-                                    try:
-                                        vollog.debug(f'_HEAP_LOCAL_SEGMENT_INFO\t: {segment_info:#x}')
-                                        active_subsegment = segment_info.ActiveSubsegment
-                                        vollog.debug(f'_HEAP_SUBSEGMENT\t\t: {active_subsegment:#x}')
-                                        user_blocks = active_subsegment.UserBlocks
-                                        vollog.debug(f'_HEAP_USERDATA_HEADER\t: {user_blocks:#x}')
-
-                                        """ Decode the fields of _HEAP_USERDATA_HEADER.EncodedOffsets """
-                                        encoded_offsets_decoded = user_blocks.EncodedOffsets.StrideAndOffset ^ user_blocks ^ lfh_heap.vol.offset ^ LFH_KEY
-                                        """ Get the relative address of the first _HEAP_ENTRY """
-                                        first_allocation_offset = encoded_offsets_decoded & 0xFFFF
-                                        """ In an LFH segment, all _HEAP_ENTRYs have the same size """
-                                        block_stride = ((encoded_offsets_decoded ^ user_blocks.EncodedOffsets.BlockStride) >> 16) & 0xFFFF
-                                        """ Another way to get get the _HEAP_ENTRY.Size """
-                                        block_size = active_subsegment.BlockSize * granularity
-                                        """ Make sure we decode the data correctly """
-                                        assert block_size == block_stride
-                                        heap_entry_addr = user_blocks + first_allocation_offset
-
-                                        """ Just save the _HEAP_ENTRYs to display them later instead of the backend heap entry """
-                                        heap_entries = []
-
-                                        for _ in range(active_subsegment.BlockCount):
-                                            try:
-                                                heap_entry = self.context.object(_HEAP_ENTRY, peb.vol.layer_name, heap_entry_addr)
-                                                heap_entries.append(heap_entry)
-                                            except exceptions.InvalidAddressException:
-                                                """ We know the _HEAP_ENTRY size anyway, continue traversing """
-                                                vollog.debug(f"{proc_name} ({pid})\t: Unable to read LFH _HEAP_ENTRY data @ {heap_entry_addr:#x}")
-                                                """ We are inserting an int instead of a StructType """
-                                                heap_entries.append(heap_entry_addr)
-
-                                            heap_entry_addr += block_size
-                                    except exceptions.InvalidAddressException:
-                                        vollog.warning(f"{proc_name} ({pid})\t: Unable to parse the _HEAP_USERDATA_HEADER @ {user_blocks:#x} of the LFH heap @ {lfh_heap.vol.offset:#x}")
-                                        continue
-
-                                    lfh_entries[int(user_blocks)] = {"block_size": block_size, "heap_entries": heap_entries}
+                            try:
+                                lfh_entries = self._get_lfh_entries(proc_name, pid, ntdll, peb.vol.layer_name, heap.FrontEndHeap)
+                            except exceptions.InvalidAddressException:
+                                vollog.warning(f"{proc_name} ({pid})\t: Unable to parse the _LFH_HEAP of _HEAP {heap:#x}")
 
                     """ Traverse the heap reserved by the backend layer """
                     segments = heap.SegmentList.to_list(f"{kernel.symbol_table_name}{constants.BANG}_HEAP_SEGMENT", "SegmentListEntry")
@@ -354,7 +406,7 @@ class HeapList(interfaces.plugins.PluginInterface):
                                     (
                                         pid,
                                         proc_name,
-                                        format_hints.Hex(heap.BaseAddress),
+                                        format_hints.Hex(heap),
                                         format_hints.Hex(segment.BaseAddress),
                                         format_hints.Hex(heap_entry_addr),
                                         format_hints.Hex(heap_entry_size),
@@ -370,7 +422,7 @@ class HeapList(interfaces.plugins.PluginInterface):
                                 If the _HEAP_ENTRY is allocated internally by the LFH heap, we only need to check the _HEAP_ENTRYs
                                 that were allocated using VirtualAlloc
                                 """
-                                if lfh_entries and HEAP_ENTRY_FLAGS.VIRTUAL_ALLOC in HEAP_ENTRY_FLAGS(heap_entry_flags):
+                                if lfh_entries and (HEAP_ENTRY_FLAGS.VIRTUAL_ALLOC in HEAP_ENTRY_FLAGS(heap_entry_flags)):
                                     """
                                     FIXME This form of traversing the LFH structures is a workaround,
                                     redo the workflow to traverse the LFH structures accordingly when parsing the backend
@@ -381,7 +433,7 @@ class HeapList(interfaces.plugins.PluginInterface):
                                     if user_blocks_address in lfh_entries:
                                         heap_layer = "lfh"
 
-                                        lfh_heap_entry_size = lfh_entries[user_blocks_address]["block_size"]
+                                        lfh_heap_entry_size = lfh_entries[user_blocks_address]["block_stride"]
 
                                         for lfh_heap_entry in lfh_entries[user_blocks_address]["heap_entries"]:
                                             """ We could not retrieve the _HEAP_ENTRY from memory, we only know the address """
@@ -391,7 +443,7 @@ class HeapList(interfaces.plugins.PluginInterface):
                                                     (
                                                         pid,
                                                         proc_name,
-                                                        format_hints.Hex(heap.BaseAddress),
+                                                        format_hints.Hex(heap),
                                                         format_hints.Hex(segment.BaseAddress),
                                                         format_hints.Hex(lfh_heap_entry),
                                                         format_hints.Hex(0),
@@ -407,9 +459,9 @@ class HeapList(interfaces.plugins.PluginInterface):
                                                 lfh_heap_entry_flags = lfh_heap_entry.UnusedBytes
 
                                                 if lfh_heap_entry_flags == LFH_HEAP_ENTRY_FREE:
-                                                    lfh_heap_entry_flags_str = 'free'
+                                                    lfh_heap_entry_flags_str = "free"
                                                 else:
-                                                    lfh_heap_entry_flags_str = 'busy'
+                                                    lfh_heap_entry_flags_str = "busy"
 
                                                 (decoded_data, file_output) = self._generate_output(proc_name, pid, peb.vol.layer_name, lfh_heap_entry, lfh_heap_entry_size, granularity)
 
@@ -418,7 +470,7 @@ class HeapList(interfaces.plugins.PluginInterface):
                                                     (
                                                         pid,
                                                         proc_name,
-                                                        format_hints.Hex(heap.BaseAddress),
+                                                        format_hints.Hex(heap),
                                                         format_hints.Hex(segment.BaseAddress),
                                                         format_hints.Hex(lfh_heap_entry.vol.offset),
                                                         format_hints.Hex(lfh_heap_entry_size),
@@ -433,9 +485,9 @@ class HeapList(interfaces.plugins.PluginInterface):
                                 """ Finally, move the pointer to the next _HEAP_ENTRY """
                                 heap_entry_addr += heap_entry_size
                         except exceptions.InvalidAddressException:
-                            vollog.warning(f"{proc_name} ({pid})\t: _HEAP_ENTRY missing\t: _HEAP {heap.BaseAddress:#x}\t: Unable to read the _HEAP_SEGMENT {segment.BaseAddress:#x} beyond _HEAP_ENTRY {heap_entry_addr:#x}")
+                            vollog.warning(f"{proc_name} ({pid})\t: _HEAP_ENTRY missing\t: _HEAP {heap:#x}\t: Unable to read the _HEAP_SEGMENT {segment.BaseAddress:#x} beyond _HEAP_ENTRY {heap_entry_addr:#x}")
                 except exceptions.InvalidAddressException:
-                    vollog.warning(f"{proc_name} ({pid})\t: Unable to access the _HEAP")
+                    vollog.warning(f"{proc_name} ({pid})\t: Unable to access the _HEAP @ {heap:#x}")
 
     def run(self):
         kernel = self.context.modules[self.config["kernel"]]

@@ -14,9 +14,9 @@ This plugin for [Volatility 3](https://github.com/volatilityfoundation/volatilit
 - Windows 11 Home 24H2 x64 (Build number 10.0.26100.1742) &check;
 - Windows 10 Education 22H2 x64 (Build number 10.0.19045.2965) &check;
 - Windows 8.1 Core x64 (Build number 6.3.9600) &check;
-- Windows 7 Professional SP1 x64 (Build number 6.1.7601) &cross;
-- Windows 7 Professional SP1 x86 (Build number 6.1.7601) &cross;
-- Windows Vista Business SP2 x64 (Build number 6.0.6002) &cross;
+- Windows 7 Professional SP1 x64 (Build number 6.1.7601) &check;
+- Windows 7 Professional SP1 x86 (Build number 6.1.7601) &check;
+- Windows Vista Business SP2 x64 (Build number 6.0.6002) &check;
 - Windows XP Professional SP3 x86 (Build number 5.1.2600) &cross;
 
 ## Installation
