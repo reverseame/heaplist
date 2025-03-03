@@ -39,8 +39,6 @@ HEAP_ENTRY_FLAGS_DISPLAY_NAMES = {
 """ Flags related to the Low-Fragmentation Heap (LFH) """
 LFH_HEAP_ACTIVE     = 0x02
 LFH_HEAP_ENTRY_FREE = 0x80
-""" The number of LFH buckets on each version of Windows ranges from 1--128 """
-NO_LFH_BUCKETS = 129
 
 class HeapList(interfaces.plugins.PluginInterface):
     """Lists the NT heap entries of processes from a Windows memory image, supporting both back end and front end (LFH) layers."""
@@ -267,9 +265,18 @@ class HeapList(interfaces.plugins.PluginInterface):
             else:
                 end_block_zone = block_zone.FreePointer
 
-            while subsegment_addr < end_block_zone:
-                subsegment = self.context.object(_HEAP_SUBSEGMENT, layer_name, subsegment_addr)
-                vollog.debug(f'{proc_name} ({pid})\t: _HEAP_SUBSEGMENT\t\t: {subsegment_addr:#x}')
+            no_subsegments = (end_block_zone - subsegment_addr) // subsegment_size
+
+            subsegment_pointers = self.context.object(
+                f"{kernel.symbol_table_name}{constants.BANG}array",
+                layer_name,
+                subsegment_addr,
+                count=no_subsegments,
+                subtype=_HEAP_SUBSEGMENT
+            )
+
+            for subsegment in subsegment_pointers:
+                vollog.debug(f'{proc_name} ({pid})\t: _HEAP_SUBSEGMENT\t\t: {subsegment.vol.offset:#x}')
                 user_blocks = subsegment.UserBlocks
                 vollog.debug(f'{proc_name} ({pid})\t: _HEAP_USERDATA_HEADER\t\t: {user_blocks:#x}')
 
@@ -278,9 +285,9 @@ class HeapList(interfaces.plugins.PluginInterface):
                         """ Decode the fields of _HEAP_USERDATA_HEADER.EncodedOffsets """
                         encoded_offsets = user_blocks.EncodedOffsets.StrideAndOffset ^ user_blocks ^ lfh_heap.vol.offset ^ LFH_KEY
                         """ Get the relative address of the first _HEAP_ENTRY """
-                        first_allocation_offset = encoded_offsets & 0xFFFF
+                        first_allocation_offset = encoded_offsets & 0xffff
                         """ In an LFH segment, all _HEAP_ENTRYs have the same size """
-                        block_stride = ((encoded_offsets ^ user_blocks.EncodedOffsets.BlockStride) >> 16) & 0xFFFF
+                        block_stride = ((encoded_offsets ^ user_blocks.EncodedOffsets.BlockStride) >> 0x10) & 0xffff
                         heap_entry_addr = user_blocks + first_allocation_offset
                     elif self._is_win_8(kuser):
                         block_stride = subsegment.BlockSize * granularity
@@ -306,9 +313,7 @@ class HeapList(interfaces.plugins.PluginInterface):
 
                     lfh_entries[int(user_blocks)] = {"block_stride": block_stride, "heap_entries": heap_entries}
                 except (exceptions.InvalidAddressException, AssertionError):
-                    vollog.warning(f'{proc_name} ({pid})\t: Unable to parse LFH _HEAP_SUBSEGMENT @ {subsegment_addr:#x}')
-
-                subsegment_addr += subsegment_size
+                    vollog.warning(f'{proc_name} ({pid})\t: Unable to parse LFH _HEAP_SUBSEGMENT @ {subsegment.vol.offset:#x}')
 
         return lfh_entries
 
@@ -423,10 +428,6 @@ class HeapList(interfaces.plugins.PluginInterface):
                                 that were allocated using VirtualAlloc
                                 """
                                 if lfh_entries and (HEAP_ENTRY_FLAGS.VIRTUAL_ALLOC in HEAP_ENTRY_FLAGS(heap_entry_flags)):
-                                    """
-                                    FIXME This form of traversing the LFH structures is a workaround,
-                                    redo the workflow to traverse the LFH structures accordingly when parsing the backend
-                                    """
                                     user_blocks_address = heap_entry_addr + granularity
 
                                     """ This _HEAP_ENTRY is actually managed by the LFH heap, let's show the entries already collected """
@@ -458,10 +459,12 @@ class HeapList(interfaces.plugins.PluginInterface):
                                                 """ We can obtain the _HEAP_ENTRY status directly from _HEAP_ENTRY.UnusedBytes """
                                                 lfh_heap_entry_flags = lfh_heap_entry.UnusedBytes
 
-                                                if lfh_heap_entry_flags == LFH_HEAP_ENTRY_FREE:
+                                                if lfh_heap_entry_flags > LFH_HEAP_ENTRY_FREE:
+                                                    lfh_heap_entry_flags_str = "busy"
+                                                elif lfh_heap_entry_flags == LFH_HEAP_ENTRY_FREE:
                                                     lfh_heap_entry_flags_str = "free"
                                                 else:
-                                                    lfh_heap_entry_flags_str = "busy"
+                                                    lfh_heap_entry_flags_str = "????"
 
                                                 (decoded_data, file_output) = self._generate_output(proc_name, pid, peb.vol.layer_name, lfh_heap_entry, lfh_heap_entry_size, granularity)
 
